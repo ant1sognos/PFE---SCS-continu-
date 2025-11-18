@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-compare.py
-----------
-Simulation du modèle SCS-like HSM/Guinot à partir d'une série de pluie
-issue du fichier ../02_Data/PQ_BV_Cloutasse.csv, en intégrant un terme
-de déplétion s_a(t) sur le réservoir d'abstraction h_a, lié à l'ETP
-SAFRAN journalière.
+compare_guinot.py
+-----------------
+Simulation du modèle SCS-like HSM/Guinot à partir :
+  - d'une série P(t), Q_ls(t) issue de ../02_Data/PQ_BV_Cloutasse.csv
+  - d'une série ETP journalière SAFRAN issue de ../02_Data/ETP_SAFRAN_J.csv
 
-L'ETP agit UNIQUEMENT sur h_a (réservoir d'abstraction).
-s_a(t) = ETP_effective(t) = min(ETP_pot(t), h_a(t))
+Hypothèses :
+  - L'ETP agit UNIQUEMENT sur h_a (réservoir d'abstraction).
+    s_a(t) = ETP_effective(t) = min(ETP_pot(t), h_a(t)).
+  - Infiltration potentielle = loi HSM de Guinot (X_begin / X_end).
+  - Infiltration limitée par l'eau disponible à la surface :
+        v <= q + h_r/dt
+  - h_r(t) = lame de ruissellement cumulée à la surface (comme h_r_vector chez Guinot).
 
 On calcule :
-  - états h_a, h_s, h_r (cumul de runoff)
-  - flux instantanés : q(t), infiltration(t), r(t)
-  - un bilan de masse global
-  - Q_mod(t) = r(t) * A_BV_M2
+  - états : h_a(t), h_s(t), h_r(t)
+  - flux instantanés : p(t), q(t), infiltration(t), r(t)
+  - bilan de masse global
+  - Q_mod(t) = r(t) * A_BV_M2 (débit m³/s) pour comparaison visuelle avec Q_ls.
 
-On suppose que Q_ls dans le CSV est en L/s -> converti en m³/s.
+AUCUN CALAGE DE PARAMÈTRES : on fixe (Ia, S, k_infiltr, k_seepage) à la main.
 """
 
 from __future__ import annotations
@@ -27,32 +31,57 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# SciPy pour le calage
-try:
-    from scipy.optimize import minimize
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
-
 
 # ======================================================================
-# 1. Modèle SCS-like HSM/Guinot avec ETP agissant sur h_a (s_a)
+# 1. Modèle SCS-like HSM/Guinot avec ETP sur h_a
 # ======================================================================
 
-def run_scs_hsm(
+def run_scs_hsm_guinot(
     dt: float,
     p_rate: np.ndarray,
     etp_rate: np.ndarray | None = None,
     i_a: float = 2e-3,
     s: float = 0.02,
-    k_infiltr: float = 1e-5,
-    k_seepage: float = 1e-6,
+    k_infiltr: float = 1,
+    k_seepage: float = 1e-3,
     h_a_init: float = 0.0,
     h_s_init: float = 0.0,
+    h_r_init: float = 0.0,
 ) -> dict:
     """
-    Modèle SCS-like HSM continu avec états h_a, h_s et ruissellement r(t).
+    Version "Guinot" adaptée à une série temporelle :
+
+      - Réservoir d'accumulation Ia (h_a), avec ETP sa(t) uniquement sur h_a.
+      - Pluie nette q(t) = (h_a_after_etp + p*dt - Ia)/dt si ha dépasse Ia.
+      - Réservoir sol h_s alimenté par infiltration potentielle de type HSM :
+
+            X = 1 - h_s / S
+            dX/dt = - (k_infiltr / S) * X^2   (Guinot)
+        intégrée par :
+
+            X_end = 1 / (1 / X_begin + k_infiltr * dt / S)
+
+        ⇒ infiltration_pot = (h_s_end - h_s_begin) / dt.
+
+      - Infiltration limitée par l'eau dispo à la surface :
+            infil <= q + h_r/dt
+        (comme dans le code de Guinot: min(infil_pot, h_r/dt + q)).
+      - Réservoir de surface h_r : lame de ruissellement cumulée (m) :
+            dh_r/dt = q - infil
+      - Seepage profond sur h_s via un terme exponentiel (k_seepage).
+
+    Sorties :
+      - t           : temps (s)
+      - p           : pluie instantanée (m/s)
+      - h_a, h_s, h_r : états (m)
+      - q           : pluie nette (m/s)
+      - infil       : infiltration effective (m/s)
+      - r_rate      : ruissellement instantané (m/s) = dh_r/dt ≥ 0
+      - sa_loss     : ETP effective sur h_a (m) par pas de temps
+      - seep_loss   : seepage profond (m) par pas de temps
+      - mass_balance: bilan de masse global (dict)
     """
+    # -- Forçages
     p_rate = np.nan_to_num(np.asarray(p_rate, dtype=float), nan=0.0)
     nt = len(p_rate)
 
@@ -63,63 +92,70 @@ def run_scs_hsm(
         if len(etp_rate) != nt:
             raise ValueError("etp_rate doit avoir la même longueur que p_rate")
 
-    t_vector = np.array([i * dt for i in range(nt + 1)], dtype=float)
+    # -- Temps
+    t = np.array([i * dt for i in range(nt + 1)], dtype=float)
 
-    # Etats
+    # -- Etats (nt+1)
     h_a = np.zeros(nt + 1, dtype=float)
     h_s = np.zeros(nt + 1, dtype=float)
-    h_r_cum = np.zeros(nt + 1, dtype=float)
-    h_a[0] = h_a_init
-    h_s[0] = h_s_init
+    h_r = np.zeros(nt + 1, dtype=float)
 
-    # Flux
-    p_store = np.zeros(nt + 1, dtype=float)
+    h_a[0] = float(h_a_init)
+    h_s[0] = float(h_s_init)
+    h_r[0] = float(h_r_init)
+
+    # -- Flux (nt)
+    p_store = np.zeros(nt, dtype=float)
     q = np.zeros(nt, dtype=float)
     infil = np.zeros(nt, dtype=float)
     r_rate = np.zeros(nt, dtype=float)
-    seep_loss = np.zeros(nt, dtype=float)
     sa_loss = np.zeros(nt, dtype=float)
+    seep_loss = np.zeros(nt, dtype=float)
 
+    # === Boucle temporelle ===
     for n in range(nt):
-        p = float(p_rate[n])
+        p = float(p_rate[n])       # [m/s]
+        etp = float(etp_rate[n])   # [m/s]
         p_store[n] = p
 
-        # 1) ETP sur h_a
+        # 1) ETP sur h_a (sa)
         h_a_0 = h_a[n]
-        etp_pot = float(etp_rate[n]) * dt
-        etp_eff = min(etp_pot, h_a_0)
+        etp_pot = etp * dt              # [m]
+        etp_eff = min(etp_pot, h_a_0)   # on ne peut évaporer plus que le stock
         h_a_after_etp = h_a_0 - etp_eff
         sa_loss[n] = etp_eff
 
-        # 2) Abstraction Ia + pluie nette q
+        # 2) Réservoir Ia -> pluie nette q
         h_a_temp = h_a_after_etp + p * dt
         if h_a_temp < i_a:
             q_n = 0.0
             h_a_next = h_a_temp
         else:
-            q_n = (h_a_temp - i_a) / dt
+            q_n = (h_a_temp - i_a) / dt   # [m/s]
             h_a_next = i_a
 
         q[n] = q_n
         h_a[n + 1] = h_a_next
 
-        # 3) Infiltration potentielle HSM
+        # 3) Infiltration potentielle HSM comme dans le code Guinot
         h_s_begin = h_s[n]
         X_begin = 1.0 - h_s_begin / s
         if X_begin <= 0.0:
-            X_begin = 1e-12
+            X_begin = 1e-12  # éviter division par zéro
         X_end = 1.0 / (1.0 / X_begin + k_infiltr * dt / s)
         h_s_end = (1.0 - X_end) * s
-        infil_pot = (h_s_end - h_s_begin) / dt
+        infil_pot = (h_s_end - h_s_begin) / dt   # [m/s]
 
-        # 4) Limitation par l'eau dispo
-        infil_n = max(0.0, min(infil_pot, q_n))
-        r_n = max(0.0, q_n - infil_n)
+        # 4) Limitation par l'eau dispo à la surface : q + h_r/dt
+        h_r_begin = h_r[n]
+        water_avail_rate = q_n + h_r_begin / dt  # [m/s]
+        if water_avail_rate < 0.0:
+            water_avail_rate = 0.0
 
+        infil_n = max(0.0, min(infil_pot, water_avail_rate))  # [m/s]
         infil[n] = infil_n
-        r_rate[n] = r_n
 
-        # 5) Sol avant seepage
+        # 5) Mise à jour du sol AVANT seepage
         h_s_temp = h_s_begin + infil_n * dt
 
         # 6) Seepage profond
@@ -130,24 +166,33 @@ def run_scs_hsm(
             h_s_after_seep = h_s_temp
             seep = 0.0
 
-        seep_loss[n] = seep
         h_s[n + 1] = h_s_after_seep
+        seep_loss[n] = seep
 
-        # 7) Ruissellement cumulé
-        h_r_cum[n + 1] = h_r_cum[n] + r_n * dt
+        # 7) Réservoir de surface h_r (lame de ruissellement cumulée)
+        #    dh_r/dt = q - infil
+        h_r[n + 1] = h_r_begin + (q_n - infil_n) * dt
+        if h_r[n + 1] < 0.0:
+            h_r[n + 1] = 0.0
 
-    # ------------------------------------------------------------------
-    # Bilan de masse
-    # ------------------------------------------------------------------
-    P_tot = float(np.nansum(p_rate) * dt)          # m
-    R_tot = float(np.nansum(r_rate) * dt)          # m
-    Seep_tot = float(np.nansum(seep_loss))         # m
-    ET_tot = float(np.nansum(sa_loss))             # m
+    # 8) Ruissellement instantané r_rate = dh_r/dt (en m/s)
+    for n in range(nt):
+        dh = h_r[n + 1] - h_r[n]
+        if dh < 0.0:
+            dh = 0.0
+        r_rate[n] = dh / dt
+
+    # 9) Bilan de masse global
+    P_tot = float(np.nansum(p_rate) * dt)      # [m]
+    R_tot = float(h_r[-1])
+    Seep_tot = float(np.nansum(seep_loss))     # [m]
+    ET_tot = float(np.nansum(sa_loss))         # [m]
+
     d_h_a = h_a[-1] - h_a[0]
     d_h_s = h_s[-1] - h_s[0]
-    delta_storage = d_h_a + d_h_s
+    delta_storage = d_h_a + d_h_s             # [m]
 
-    mb_error = P_tot - (R_tot + Seep_tot + ET_tot + delta_storage)
+    closure = P_tot - (R_tot + Seep_tot + ET_tot + delta_storage)
 
     mass_balance = {
         "P_tot_m": P_tot,
@@ -155,28 +200,28 @@ def run_scs_hsm(
         "Seep_tot_m": Seep_tot,
         "ET_tot_m": ET_tot,
         "Delta_storage_m": delta_storage,
-        "Closure_error_m": mb_error,
-        "Closure_error_mm": mb_error * 1000.0,
-        "Relative_error_%": 100.0 * mb_error / P_tot if P_tot > 0 else np.nan,
+        "Closure_error_m": closure,
+        "Closure_error_mm": closure * 1000.0,
+        "Relative_error_%": 100.0 * closure / P_tot if P_tot > 0 else np.nan,
     }
 
     return {
-        "t": t_vector,
+        "t": t,
         "p": p_store,
         "h_a": h_a,
         "h_s": h_s,
-        "h_r": h_r_cum,
+        "h_r": h_r,
         "q": q,
         "infil": infil,
         "r_rate": r_rate,
-        "seep_loss": seep_loss,
         "sa_loss": sa_loss,
+        "seep_loss": seep_loss,
         "mass_balance": mass_balance,
     }
 
 
 # ======================================================================
-# 2. Lecture pluie + Q_ls (en L/s) -> Q_ls en m³/s
+# 2. Lecture pluie + Q_ls (L/s) -> Q_ls (m³/s)
 # ======================================================================
 
 def read_rain_series_from_csv(csv_name: str, dt: float = 300.0):
@@ -184,9 +229,9 @@ def read_rain_series_from_csv(csv_name: str, dt: float = 300.0):
     Lit ../02_Data/csv_name (séparateur ';'), extrait :
       - dateP   : datetimes
       - P_mm    : pluie (mm / 5 min)  (NA -> 0)
-      - Q_ls    : débit mesuré (supposé en L/s -> converti en m³/s)
+      - Q_ls    : débit mesuré (L/s) -> m³/s
 
-    Renvoie (time_index, P_mm, p_rate_m_per_s, q_ls_m3s)
+    Renvoie : (time_index, P_mm, p_rate_m_per_s, q_ls_m3s)
     """
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir.parent / "02_Data"
@@ -243,7 +288,7 @@ def read_etp_series_for_time_index(
             date_col = c
             break
     if date_col is None:
-        raise ValueError("Impossible de trouver la colonne date dans le fichier ETP.")
+        raise ValueError("Colonne date absente dans le fichier ETP.")
 
     etp_col = None
     for c in ["ETP", "etp", "Etp"]:
@@ -251,7 +296,7 @@ def read_etp_series_for_time_index(
             etp_col = c
             break
     if etp_col is None:
-        raise ValueError("Impossible de trouver la colonne ETP dans le fichier ETP.")
+        raise ValueError("Colonne ETP absente dans le fichier ETP.")
 
     df_etp[date_col] = pd.to_datetime(df_etp[date_col].astype(str), format="%Y%m%d")
     df_etp[date_col] = df_etp[date_col].dt.normalize()
@@ -267,7 +312,7 @@ def read_etp_series_for_time_index(
 
 
 # ======================================================================
-# 4. Bilan de masse – impression
+# 4. Impression bilan de masse
 # ======================================================================
 
 def print_mass_balance(mb: dict):
@@ -282,135 +327,59 @@ def print_mass_balance(mb: dict):
 
 
 # ======================================================================
-# 5. Calage des paramètres sur Q_ls (RMSE)
-# ======================================================================
-
-def calibrate_scs_hsm(
-    dt: float,
-    p_rate: np.ndarray,
-    etp_rate: np.ndarray,
-    q_obs: np.ndarray,
-    A_bv_m2: float,
-    i_a_init: float,
-    s_init: float,
-    k_infiltr_init: float,
-    k_seepage_init: float,
-):
-    if not HAS_SCIPY:
-        raise RuntimeError("SciPy n'est pas disponible : calage impossible.")
-
-    p_rate = np.asarray(p_rate, dtype=float)
-    etp_rate = np.asarray(etp_rate, dtype=float)
-    q_obs = np.asarray(q_obs, dtype=float)
-
-    mask = ~np.isnan(q_obs)
-    if mask.sum() == 0:
-        raise ValueError("q_obs ne contient aucune valeur valide (toutes NaN ?)")
-
-    def objective(theta: np.ndarray) -> float:
-        i_a, s, k_inf, k_seep = theta
-        if i_a <= 0 or s <= 0 or k_inf <= 0 or k_seep < 0:
-            return 1e6
-
-        res = run_scs_hsm(
-            dt=dt,
-            p_rate=p_rate,
-            etp_rate=etp_rate,
-            i_a=i_a,
-            s=s,
-            k_infiltr=k_inf,
-            k_seepage=k_seep,
-            h_a_init=0.0,
-            h_s_init=0.0,
-        )
-
-        r_rate = res["r_rate"]          # <<< plus de [: -1]
-        q_mod = r_rate * A_bv_m2        # m³/s
-
-        diff = q_mod[mask] - q_obs[mask]
-        return float(np.sqrt(np.mean(diff**2)))
-
-    x0 = np.array([i_a_init, s_init, k_infiltr_init, k_seepage_init], dtype=float)
-    bounds = [
-        (1e-4, 0.05),   # i_a
-        (1e-3, 0.20),   # s
-        (1e-7, 1e-3),   # k_infiltr
-        (0.0,  1e-3),   # k_seepage
-    ]
-
-    result = minimize(objective, x0, method="L-BFGS-B", bounds=bounds)
-    return {
-        "opt_params": {
-            "i_a": result.x[0],
-            "s": result.x[1],
-            "k_infiltr": result.x[2],
-            "k_seepage": result.x[3],
-        },
-        "rmse_opt": float(result.fun),
-        "success": bool(result.success),
-        "message": result.message,
-    }
-
-
-# ======================================================================
-# 6. Script principal
+# 5. Script principal (AUCUN CALAGE)
 # ======================================================================
 
 def main():
-    dt = 300.0  # 5 min
+    dt = 300.0  # pas de temps = 5 min
     csv_rain = "PQ_BV_Cloutasse.csv"
     csv_etp = "ETP_SAFRAN_J.csv"
 
-    # Aire du bassin : 0.8 km²
-    A_BV_M2 = 0.8 * 1e6
+    # Aire du bassin pour construire Q_mod (0.8 km² par ex.)
+    A_BV_M2 = 800000 
 
+    # -- Lecture des données
     time_index, rain_5min_mm, p_rate, q_obs = read_rain_series_from_csv(csv_rain, dt)
     etp_rate = read_etp_series_for_time_index(csv_etp, time_index)
 
-    # Paramètres initiaux
-    i_a = 2e-3
-    s = 0.02
-    k_infiltr = 1e-5
-    k_seepage = 1e-6
+    # -- Paramètres 
+    i_a = 0.01
+    s = 0.15
+    k_infiltr = 5e-7
+    k_seepage = 1e-7
 
-    if q_obs is not None and HAS_SCIPY:
-        print("Lancement du calage des paramètres sur Q_ls (RMSE)...")
-        calib = calibrate_scs_hsm(
-            dt, p_rate, etp_rate, q_obs, A_BV_M2,
-            i_a, s, k_infiltr, k_seepage,
-        )
-        print("\n=== Résultats du calage ===")
-        print(f"Succès      : {calib['success']}")
-        print(f"Message     : {calib['message']}")
-        print(f"RMSE_opt    : {calib['rmse_opt']:.3f} m³/s")
-        for k, v in calib["opt_params"].items():
-            print(f"  {k} = {v:.6g}")
+    # -- Simulation simple du modèle .
+    res = run_scs_hsm_guinot(
+        dt=dt,
+        p_rate=p_rate,
+        etp_rate=etp_rate,
+        i_a=i_a,
+        s=s,
+        k_infiltr=k_infiltr,
+        k_seepage=k_seepage,
+        h_a_init=0.0,
+        h_s_init=0.0,
+        h_r_init=0.0,
+    )
 
-        i_a = calib["opt_params"]["i_a"]
-        s = calib["opt_params"]["s"]
-        k_infiltr = calib["opt_params"]["k_infiltr"]
-        k_seepage = calib["opt_params"]["k_seepage"]
-
-    res = run_scs_hsm(dt, p_rate, etp_rate,
-                      i_a=i_a, s=s,
-                      k_infiltr=k_infiltr, k_seepage=k_seepage)
-
-    # Etats : nt+1 -> alignés sur nt par [: -1]
+    # Etats (nt+1), alignés sur time_index (nt) en coupant le dernier point
     h_a = res["h_a"][:-1]
     h_s = res["h_s"][:-1]
     h_r = res["h_r"][:-1]
-    # Flux : déjà de longueur nt
-    r_rate = res["r_rate"]
+    r_rate = res["r_rate"]           # [m/s]
 
+    # Lame de ruissellement instantanée en mm / 5 min
     runoff_5min_mm = r_rate * dt * 1000.0
 
     base_dir = Path(__file__).resolve().parent
     plots_dir = base_dir.parent / "03_Plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
-    out_path_main = plots_dir / "runoff_scs_hsm_PQ_BV_Cloutasse.png"
-    out_path_Q = plots_dir / "runoff_vs_Qls_PQ_BV_Cloutasse.png"
+    out_path_main = plots_dir / "runoff_scs_hsm_PQ_BV_Cloutasse_debug.png"
+    out_path_Q = plots_dir / "runoff_vs_Qls_PQ_BV_Cloutasse_debug.png"
 
-    # Figure principale
+    # --------------------------------------------------------------
+    # Figure principale : états + flux surfaciques
+    # --------------------------------------------------------------
     fig, ax1 = plt.subplots(figsize=(12, 6))
     line_ha, = ax1.plot(time_index, h_a, color="grey", label="h in i_a")
     line_hs, = ax1.plot(time_index, h_s, color="green", label="h in soil")
@@ -432,42 +401,40 @@ def main():
     ax1.legend(lines, labels, loc="upper left")
 
     fig.suptitle(
-        "SCS-like runoff-infiltration model (HSM)\n"
-        "(données PQ_BV_Cloutasse + ETP SAFRAN, ETP sur h_a uniquement)"
+        "SCS-like runoff-infiltration model (Guinot/HSM)\n"
+        "(PQ_BV_Cloutasse)"
     )
     fig.tight_layout()
     fig.savefig(out_path_main, dpi=300, bbox_inches="tight")
     plt.show()
     print(f"Figure principale enregistrée dans : {out_path_main.resolve()}")
 
-    # Comparaison Q_mod vs Q_obs
+    # --------------------------------------------------------------
+    # Comparaison Q_mod vs Q_obs 
+    # --------------------------------------------------------------
     if q_obs is not None:
-        q_mod = r_rate * A_BV_M2  # m³/s
+        q_obs = np.asarray(q_obs, dtype=float)
+        q_mod = r_rate * A_BV_M2  # [m³/s]
 
         fig2, ax_q = plt.subplots(figsize=(12, 4))
-        ax_q.plot(time_index, q_mod, label="Q modèle (ruissellement)", linewidth=1.0)
+        ax_q.plot(time_index, q_mod, label="Q modèle", linewidth=1.0)
         ax_q.plot(time_index, q_obs, label="Q_ls observé", linewidth=1.0, alpha=0.7)
         ax_q.set_xlabel("Date")
         ax_q.set_ylabel("Débit (m³/s)")
         ax_q.grid(True)
         ax_q.legend()
-        fig2.suptitle("Comparaison débit modèle SCS-like vs Q_ls observé")
+        fig2.suptitle("Comparaison Q_mod vs Q_ls observé ")
         fig2.tight_layout()
         fig2.savefig(out_path_Q, dpi=300, bbox_inches="tight")
         plt.show()
         print(f"Figure Q_mod vs Q_ls enregistrée dans : {out_path_Q.resolve()}")
 
-        mask = ~np.isnan(q_obs)
-        if mask.sum() > 0:
-            diff = q_mod[mask] - q_obs[mask]
-            rmse = float(np.sqrt(np.mean(diff**2)))
-            denom = np.sum((q_obs[mask] - np.mean(q_obs[mask]))**2)
-            nse = 1.0 - np.sum(diff**2) / denom if denom > 0 else np.nan
-            print(f"RMSE (Q_mod, Q_obs) = {rmse:.2f} m³/s")
-            print(f"NSE  (Q_mod, Q_obs) = {nse:.3f}")
     else:
         print("Pas de colonne Q_ls : pas de comparaison débit.")
 
+    # --------------------------------------------------------------
+    # Bilan de masse
+    # --------------------------------------------------------------
     print_mass_balance(res["mass_balance"])
 
 

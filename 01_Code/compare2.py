@@ -21,6 +21,9 @@ On calcule :
   - Q_mod(t) = r(t) * A_BV_M2 (débit m³/s) pour comparaison visuelle avec Q_ls.
 
 AUCUN CALAGE DE PARAMÈTRES : on fixe (Ia, S, k_infiltr, k_seepage) à la main.
+
+Created on Tue Nov 18 15:41:17 2025
+@author: asognos
 """
 
 from __future__ import annotations
@@ -36,6 +39,111 @@ import matplotlib.pyplot as plt
 # 1. Modèle SCS-like HSM/Guinot avec ETP sur h_a
 # ======================================================================
 
+def run_scs_hsm_guinot_numba(
+    dt: float,
+    p_rate: np.ndarray,
+    etp_rate: np.ndarray,
+    i_a: float,
+    s: float,
+    k_infiltr: float,
+    k_seepage: float,
+    h_a_init: float,
+    h_s_init: float,
+    h_r_init: float,
+) -> tuple:
+    """
+    Version Numba JIT (compiled). Retourne tous les vecteurs en tuple.
+    """
+    nt = len(p_rate)
+    
+    # États (nt+1)
+    h_a = np.zeros(nt + 1, dtype=np.float64)
+    h_s = np.zeros(nt + 1, dtype=np.float64)
+    h_r = np.zeros(nt + 1, dtype=np.float64)
+    
+    h_a[0] = h_a_init
+    h_s[0] = h_s_init
+    h_r[0] = h_r_init
+    
+    # Flux (nt)
+    p_store = np.zeros(nt, dtype=np.float64)
+    q = np.zeros(nt, dtype=np.float64)
+    infil = np.zeros(nt, dtype=np.float64)
+    r_rate = np.zeros(nt, dtype=np.float64)
+    sa_loss = np.zeros(nt, dtype=np.float64)
+    seep_loss = np.zeros(nt, dtype=np.float64)
+    
+    for n in range(nt):
+        p = p_rate[n]
+        etp = etp_rate[n]
+        p_store[n] = p
+        
+        # 1) ETP sur h_a
+        h_a_0 = h_a[n]
+        etp_pot = etp * dt
+        etp_eff = min(etp_pot, h_a_0)
+        h_a_after_etp = h_a_0 - etp_eff
+        sa_loss[n] = etp_eff
+        
+        # 2) Réservoir Ia
+        h_a_temp = h_a_after_etp + p * dt
+        if h_a_temp < i_a:
+            q_n = 0.0
+            h_a_next = h_a_temp
+        else:
+            q_n = (h_a_temp - i_a) / dt
+            h_a_next = i_a
+        
+        q[n] = q_n
+        h_a[n + 1] = h_a_next
+        
+        # 3) Infiltration potentielle HSM
+        h_s_begin = h_s[n]
+        X_begin = 1.0 - h_s_begin / s
+        if X_begin <= 0.0:
+            X_begin = 1e-12
+        X_end = 1.0 / (1.0 / X_begin + k_infiltr * dt / s)
+        h_s_end = (1.0 - X_end) * s
+        infil_pot = (h_s_end - h_s_begin) / dt
+        
+        # 4) Limitation par l'eau dispo
+        h_r_begin = h_r[n]
+        water_avail_rate = q_n + h_r_begin / dt
+        if water_avail_rate < 0.0:
+            water_avail_rate = 0.0
+        
+        infil_n = max(0.0, min(infil_pot, water_avail_rate))
+        infil[n] = infil_n
+        
+        # 5) Mise à jour du sol
+        h_s_temp = h_s_begin + infil_n * dt
+        
+        # 6) Seepage profond
+        if k_seepage > 0.0:
+            h_s_after_seep = h_s_temp * np.exp(-k_seepage * dt)
+            seep = h_s_temp - h_s_after_seep
+        else:
+            h_s_after_seep = h_s_temp
+            seep = 0.0
+        
+        h_s[n + 1] = h_s_after_seep
+        seep_loss[n] = seep
+        
+        # 7) Réservoir de surface h_r
+        h_r[n + 1] = h_r_begin + (q_n - infil_n) * dt
+        if h_r[n + 1] < 0.0:
+            h_r[n + 1] = 0.0
+    
+    # 8) Ruissellement instantané
+    for n in range(nt):
+        dh = h_r[n + 1] - h_r[n]
+        if dh < 0.0:
+            dh = 0.0
+        r_rate[n] = dh / dt
+    
+    return h_a, h_s, h_r, p_store, q, infil, r_rate, sa_loss, seep_loss
+
+
 def run_scs_hsm_guinot(
     dt: float,
     p_rate: np.ndarray,
@@ -49,39 +157,8 @@ def run_scs_hsm_guinot(
     h_r_init: float = 0.0,
 ) -> dict:
     """
-    Version "Guinot" adaptée à une série temporelle :
-
-      - Réservoir d'accumulation Ia (h_a), avec ETP sa(t) uniquement sur h_a.
-      - Pluie nette q(t) = (h_a_after_etp + p*dt - Ia)/dt si ha dépasse Ia.
-      - Réservoir sol h_s alimenté par infiltration potentielle de type HSM :
-
-            X = 1 - h_s / S
-            dX/dt = - (k_infiltr / S) * X^2   (Guinot)
-        intégrée par :
-
-            X_end = 1 / (1 / X_begin + k_infiltr * dt / S)
-
-        ⇒ infiltration_pot = (h_s_end - h_s_begin) / dt.
-
-      - Infiltration limitée par l'eau dispo à la surface :
-            infil <= q + h_r/dt
-        (comme dans le code de Guinot: min(infil_pot, h_r/dt + q)).
-      - Réservoir de surface h_r : lame de ruissellement cumulée (m) :
-            dh_r/dt = q - infil
-      - Seepage profond sur h_s via un terme exponentiel (k_seepage).
-
-    Sorties :
-      - t           : temps (s)
-      - p           : pluie instantanée (m/s)
-      - h_a, h_s, h_r : états (m)
-      - q           : pluie nette (m/s)
-      - infil       : infiltration effective (m/s)
-      - r_rate      : ruissellement instantané (m/s) = dh_r/dt ≥ 0
-      - sa_loss     : ETP effective sur h_a (m) par pas de temps
-      - seep_loss   : seepage profond (m) par pas de temps
-      - mass_balance: bilan de masse global (dict)
+    Wrapper appelant la version Numba.
     """
-    # -- Forçages
     p_rate = np.nan_to_num(np.asarray(p_rate, dtype=float), nan=0.0)
     nt = len(p_rate)
 
@@ -92,105 +169,29 @@ def run_scs_hsm_guinot(
         if len(etp_rate) != nt:
             raise ValueError("etp_rate doit avoir la même longueur que p_rate")
 
-    # -- Temps
+    h_a, h_s, h_r, p_store, q, infil, r_rate, sa_loss, seep_loss = run_scs_hsm_guinot_numba(
+        dt=dt,
+        p_rate=p_rate,
+        etp_rate=etp_rate,
+        i_a=i_a,
+        s=s,
+        k_infiltr=k_infiltr,
+        k_seepage=k_seepage,
+        h_a_init=h_a_init,
+        h_s_init=h_s_init,
+        h_r_init=h_r_init,
+    )
+    
     t = np.array([i * dt for i in range(nt + 1)], dtype=float)
-
-    # -- Etats (nt+1)
-    h_a = np.zeros(nt + 1, dtype=float)
-    h_s = np.zeros(nt + 1, dtype=float)
-    h_r = np.zeros(nt + 1, dtype=float)
-
-    h_a[0] = float(h_a_init)
-    h_s[0] = float(h_s_init)
-    h_r[0] = float(h_r_init)
-
-    # -- Flux (nt)
-    p_store = np.zeros(nt, dtype=float)
-    q = np.zeros(nt, dtype=float)
-    infil = np.zeros(nt, dtype=float)
-    r_rate = np.zeros(nt, dtype=float)
-    sa_loss = np.zeros(nt, dtype=float)
-    seep_loss = np.zeros(nt, dtype=float)
-
-    # === Boucle temporelle ===
-    for n in range(nt):
-        p = float(p_rate[n])       # [m/s]
-        etp = float(etp_rate[n])   # [m/s]
-        p_store[n] = p
-
-        # 1) ETP sur h_a (sa)
-        h_a_0 = h_a[n]
-        etp_pot = etp * dt              # [m]
-        etp_eff = min(etp_pot, h_a_0)   # on ne peut évaporer plus que le stock
-        h_a_after_etp = h_a_0 - etp_eff
-        sa_loss[n] = etp_eff
-
-        # 2) Réservoir Ia -> pluie nette q
-        h_a_temp = h_a_after_etp + p * dt
-        if h_a_temp < i_a:
-            q_n = 0.0
-            h_a_next = h_a_temp
-        else:
-            q_n = (h_a_temp - i_a) / dt   # [m/s]
-            h_a_next = i_a
-
-        q[n] = q_n
-        h_a[n + 1] = h_a_next
-
-        # 3) Infiltration potentielle HSM comme dans le code Guinot
-        h_s_begin = h_s[n]
-        X_begin = 1.0 - h_s_begin / s
-        if X_begin <= 0.0:
-            X_begin = 1e-12  # éviter division par zéro
-        X_end = 1.0 / (1.0 / X_begin + k_infiltr * dt / s)
-        h_s_end = (1.0 - X_end) * s
-        infil_pot = (h_s_end - h_s_begin) / dt   # [m/s]
-
-        # 4) Limitation par l'eau dispo à la surface : q + h_r/dt
-        h_r_begin = h_r[n]
-        water_avail_rate = q_n + h_r_begin / dt  # [m/s]
-        if water_avail_rate < 0.0:
-            water_avail_rate = 0.0
-
-        infil_n = max(0.0, min(infil_pot, water_avail_rate))  # [m/s]
-        infil[n] = infil_n
-
-        # 5) Mise à jour du sol AVANT seepage
-        h_s_temp = h_s_begin + infil_n * dt
-
-        # 6) Seepage profond
-        if k_seepage > 0.0:
-            h_s_after_seep = h_s_temp * math.exp(-k_seepage * dt)
-            seep = h_s_temp - h_s_after_seep
-        else:
-            h_s_after_seep = h_s_temp
-            seep = 0.0
-
-        h_s[n + 1] = h_s_after_seep
-        seep_loss[n] = seep
-
-        # 7) Réservoir de surface h_r (lame de ruissellement cumulée)
-        #    dh_r/dt = q - infil
-        h_r[n + 1] = h_r_begin + (q_n - infil_n) * dt
-        if h_r[n + 1] < 0.0:
-            h_r[n + 1] = 0.0
-
-    # 8) Ruissellement instantané r_rate = dh_r/dt (en m/s)
-    for n in range(nt):
-        dh = h_r[n + 1] - h_r[n]
-        if dh < 0.0:
-            dh = 0.0
-        r_rate[n] = dh / dt
-
-    # 9) Bilan de masse global
-    P_tot = float(np.nansum(p_rate) * dt)      # [m]
+    
+    P_tot = float(np.nansum(p_rate) * dt)
     R_tot = float(h_r[-1])
-    Seep_tot = float(np.nansum(seep_loss))     # [m]
-    ET_tot = float(np.nansum(sa_loss))         # [m]
+    Seep_tot = float(np.nansum(seep_loss))
+    ET_tot = float(np.nansum(sa_loss))
 
     d_h_a = h_a[-1] - h_a[0]
     d_h_s = h_s[-1] - h_s[0]
-    delta_storage = d_h_a + d_h_s             # [m]
+    delta_storage = d_h_a + d_h_s
 
     closure = P_tot - (R_tot + Seep_tot + ET_tot + delta_storage)
 
@@ -252,7 +253,9 @@ def read_rain_series_from_csv(csv_name: str, dt: float = 300.0):
     q_ls = None
     if "Q_ls" in df.columns:
         q_raw = df["Q_ls"].astype(float).to_numpy()
-        q_ls = q_raw  # L/s -> m³/s
+        # si tu veux vraiment des m³/s, décommente :
+        # q_ls = q_raw / 1000.0
+        q_ls = q_raw
 
     return time_index, rain_5min_mm, p_rate, q_ls
 
@@ -322,8 +325,12 @@ def print_mass_balance(mb: dict):
     print(f"Seepage profond= {mb['Seep_tot_m']*1000:.1f} mm")
     print(f"ETP effective (s_a sur h_a) = {mb['ET_tot_m']*1000:.1f} mm")
     print(f"ΔStock (Ia+sol)            = {mb['Delta_storage_m']*1000:.2f} mm")
-    print(f"Erreur de fermeture         = {mb['Closure_error_mm']:.3f} mm "
-          f"({mb['Relative_error_%']:.3f} %)")
+    print(
+        f"Erreur de fermeture         = {mb['Closure_error_mm']:.3f} mm "
+        f"({mb['Relative_error_%']:.3f} %)"
+    )
+
+
 def main():
     dt = 300.0  # pas de temps = 5 min
     csv_rain = "PQ_BV_Cloutasse.csv"
@@ -337,10 +344,10 @@ def main():
     etp_rate = read_etp_series_for_time_index(csv_etp, time_index)
 
     # -- Paramètres 
-    i_a = 0.04  # 3 mm de perte initiale 
-    s = 0.4     # réservoir sol de 30 cm 
-    k_infiltr = 1e-7
-    k_seepage = 1e-7
+    i_a = 0.04  # pertes initiales (m)
+    s = 0.5     # capacité sol (m)
+    k_infiltr = 5e-7
+    k_seepage = 5e-7
 
     # -- Simulation simple du modèle
     res = run_scs_hsm_guinot(
@@ -356,7 +363,7 @@ def main():
         h_r_init=0.0,
     )
 
-    # Etats (nt+1), alignés sur time_index (nt) en coupant le dernier point
+    # États (nt+1), alignés sur time_index (nt) en coupant le dernier point
     h_a = res["h_a"][:-1]
     h_s = res["h_s"][:-1]
     h_r = res["h_r"][:-1]
@@ -391,31 +398,31 @@ def main():
     #  B. DÉCIMATION POUR L'AFFICHAGE UNIQUEMENT
     # ==========================================
 
-    # 1 point sur 12 -> 1 h (12 * 5 min)
-    step_plot = 12
+    step_plot = 12  # 1 point sur 12 -> 1 h (12 * 5 min)
     idx = slice(0, len(time_index), step_plot)
 
-    t_plot         = time_index[idx]
-    P_mm_5_plot    = P_mm_5[idx]
-    Qeff_mm_5_plot = Qeff_mm_5[idx]
-    Infil_mm_5_plot= Infil_mm_5[idx]
-    Runoff_mm_5_plot = Runoff_mm_5[idx]
+    t_plot           = time_index[idx]
+    P_mm_5_plot     = P_mm_5[idx]
+    Qeff_mm_5_plot  = Qeff_mm_5[idx]
+    Infil_mm_5_plot = Infil_mm_5[idx]
+    Runoff_mm_5_plot= Runoff_mm_5[idx]
 
-    P_cum_plot     = P_cum_mm[idx]
-    R_cum_plot     = R_cum_mm[idx]
-    Infil_cum_plot = Infil_cum_mm[idx]
-    Seep_cum_plot  = Seep_cum_mm[idx]
-    ET_cum_plot    = ET_cum_mm[idx]
+    P_cum_plot      = P_cum_mm[idx]
+    R_cum_plot      = R_cum_mm[idx]
+    Infil_cum_plot  = Infil_cum_mm[idx]
+    Seep_cum_plot   = Seep_cum_mm[idx]
+    ET_cum_plot     = ET_cum_mm[idx]
 
     h_a_plot = h_a[idx]
     h_s_plot = h_s[idx]
     h_r_plot = h_r[idx]
 
     if q_obs is not None:
-        q_obs_m3s = np.asarray(q_obs, dtype=float) / 1000.0
+        q_obs_m3s = np.asarray(q_obs, dtype=float) / 1000.0  # si Q_ls en L/s
         q_obs_plot = q_obs_m3s[idx]
     else:
         q_obs_plot = None
+
     q_mod_full = r_rate * A_BV_M2
     q_mod_plot = q_mod_full[idx]
 
@@ -433,7 +440,6 @@ def main():
 
     fig1, ax = plt.subplots(figsize=(12, 5))
 
-    # tracer d'abord les lignes, puis la pluie en barres
     ax.plot(t_plot, Qeff_mm_5_plot,   label="Pluie nette q (mm / 5 min)")
     ax.plot(t_plot, Infil_mm_5_plot,  label="Infiltration (mm / 5 min)")
     ax.plot(t_plot, Runoff_mm_5_plot, label="Ruissellement r (mm / 5 min)")
@@ -444,10 +450,10 @@ def main():
     ax.set_xlabel("Date")
     ax.set_ylabel("Flux (mm / 5 min)")
     ax.grid(True)
-    ax.legend(loc="upper right")  # éviter loc="best"
+    ax.legend(loc="upper right")
     fig1.suptitle("Flux instantanés (P, q, infiltration, ruissellement)")
     fig1.tight_layout()
-    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=150)
+    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=100)
 
     # ==============================
     #  FIGURE 2 : cumuls (mm)
@@ -467,7 +473,7 @@ def main():
     ax2.legend(loc="upper left")
     fig2.suptitle("Cumuls P / ruissellement / infiltration / ET / seepage")
     fig2.tight_layout()
-    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep.png", dpi=150)
+    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep.png", dpi=100)
 
     # ===================================
     #  FIGURE 3 : États des réservoirs
@@ -477,7 +483,7 @@ def main():
 
     ax3.plot(t_plot, h_a_plot, label="h_a (Ia)",  color="grey")
     ax3.plot(t_plot, h_s_plot, label="h_s (sol)", color="green")
-    ax3.plot(t_plot, h_r_plot, label="h_r ", color="red")
+    ax3.plot(t_plot, h_r_plot, label="h_r",       color="red")
 
     ax3.set_xlabel("Date")
     ax3.set_ylabel("Hauteurs (m)")
@@ -485,7 +491,7 @@ def main():
     ax3.legend(loc="upper left")
     fig3.suptitle("États des réservoirs (Ia, sol, runoff)")
     fig3.tight_layout()
-    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff.png", dpi=150)
+    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff.png", dpi=100)
 
     # ==========================================
     #  FIGURE 4 : Hydrogramme Q_mod vs Q_obs
@@ -493,8 +499,8 @@ def main():
 
     if q_obs_plot is not None:
         fig4, ax4 = plt.subplots(figsize=(12, 4))
-        ax4.plot(t_plot, q_mod_plot,     label="Q_mod (r_rate * A)", linewidth=1.0)
-        ax4.plot(t_plot, q_obs_plot,     label="Q_obs (Q_ls)",       linewidth=1.0, alpha=0.7)
+        ax4.plot(t_plot, q_mod_plot, label="Q_mod (r_rate * A)", linewidth=1.0)
+        ax4.plot(t_plot, q_obs_plot, label="Q_obs (Q_ls)",       linewidth=1.0, alpha=0.7)
 
         ax4.set_xlabel("Date")
         ax4.set_ylabel("Débit (m³/s)")
@@ -502,7 +508,7 @@ def main():
         ax4.legend(loc="upper right")
         fig4.suptitle("Comparaison Q_mod vs Q_obs (m³/s)")
         fig4.tight_layout()
-        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs.png", dpi=150)
+        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs.png", dpi=100)
     else:
         print("Pas de Q_obs : pas de figure Q_mod vs Q_obs.")
 
@@ -510,6 +516,7 @@ def main():
     # Bilan de masse
     # --------------------------------------------------------------
     print_mass_balance(res["mass_balance"])
+
 
 
 if __name__ == "__main__":

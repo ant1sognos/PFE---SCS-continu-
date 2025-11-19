@@ -1,14 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Nov 19 13:03:17 2025
-
-@author: asognos
-"""
-
-# -*- coding: utf-8 -*-
-"""
-compare_guinot.py
------------------
 Simulation du modèle SCS-like HSM/Guinot à partir :
   - d'une série P(t), Q_ls(t) issue de ../02_Data/PQ_BV_Cloutasse.csv
   - d'une série ETP journalière SAFRAN issue de ../02_Data/ETP_SAFRAN_J.csv
@@ -43,9 +34,183 @@ mpl.rcParams["path.simplify"] = True
 mpl.rcParams["path.simplify_threshold"] = 1.0
 mpl.rcParams["agg.path.chunksize"] = 10000
 
-# import matplotlib
-# matplotlib.use("Agg")  # backend non interactif, plus rapide
-# import matplotlib.pyplot as plt
+
+# 0. Tracé des débits modélisés 
+
+
+def analyse_evenements_modele(
+    time_index: pd.DatetimeIndex,
+    q_mod_full: np.ndarray,
+    q_obs_m3s: np.ndarray | None,
+    rain_5min_mm: np.ndarray,
+    dt: float,
+    A_BV_M2: float,
+):
+    """
+    Utilise les évènements détectés sur Q_obs (obs_summary.csv) pour :
+      - tracer Q_obs vs Q_mod + pluie P pour chaque évènement,
+      - calculer Qmax, volumes, etc. pour Q_mod,
+      - écrire un CSV de synthèse (obs vs mod).
+
+    On suppose que observeMod_Th.py a déjà été lancé et a créé :
+      ../03_Plots/events_obs/obs_summary.csv
+    """
+
+    base_dir = Path(__file__).resolve().parent
+    plots_root = base_dir.parent / "03_Plots"
+    events_obs_dir = plots_root / "events_obs"
+    events_mod_dir = plots_root / "events_mod"
+    events_mod_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_obs_path = events_obs_dir / "obs_summary.csv"
+    if not summary_obs_path.exists():
+        raise FileNotFoundError(
+            f"Résumé des évènements obs introuvable : {summary_obs_path}\n"
+            "→ Lance d'abord observeMod_Th.py pour détecter les évènements sur Q_obs."
+        )
+
+    # --- lecture du résumé des évènements observés ---
+    events_obs = pd.read_csv(
+        summary_obs_path,
+        sep=",",
+        index_col="event_id",
+        parse_dates=["t_start_full", "t_end_full",
+                     "t_start_core", "t_end_core", "t_Qmax"],
+    )
+
+    # --- séries complètes sous forme de Series pandas ---
+    q_mod_series = pd.Series(q_mod_full, index=time_index, name="Q_mod_m3s")
+    P_series = pd.Series(rain_5min_mm, index=time_index, name="P_mm_5min")
+
+    if q_obs_m3s is not None:
+        q_obs_series = pd.Series(q_obs_m3s, index=time_index, name="Q_obs_m3s")
+    else:
+        q_obs_series = None
+
+    dt_seconds = float(dt)
+    metrics_rows = []
+
+    # =================================================================
+    # Boucle sur les évènements détectés sur Q_obs
+    # =================================================================
+    for event_id, row in events_obs.iterrows():
+        t0 = row["t_start_full"]
+        t1 = row["t_end_full"]
+
+        # sécurité : si la fenêtre dépasse la série, on coupe
+        q_mod_evt = q_mod_series.loc[t0:t1]
+        P_evt = P_series.loc[t0:t1]
+
+        if q_mod_evt.empty:
+            continue  # évènement hors période de modélisation
+
+        if q_obs_series is not None:
+            q_obs_evt = q_obs_series.loc[t0:t1]
+        else:
+            q_obs_evt = None
+
+        # --- métriques sur Q_mod ---
+        Qmax_mod = float(q_mod_evt.max())
+        t_Qmax_mod = q_mod_evt.idxmax()
+        Vol_mod_m3 = float((q_mod_evt * dt_seconds).sum())
+
+        # métriques obs sur la même fenêtre (si dispo)
+        if q_obs_evt is not None and not q_obs_evt.empty:
+            Qmax_obs = float(q_obs_evt.max())
+            t_Qmax_obs = q_obs_evt.idxmax()
+            Vol_obs_m3 = float((q_obs_evt * dt_seconds).sum())
+        else:
+            Qmax_obs = np.nan
+            t_Qmax_obs = pd.NaT
+            Vol_obs_m3 = np.nan
+
+        duration_s = (q_mod_evt.index[-1] - q_mod_evt.index[0]).total_seconds()
+
+        metrics_rows.append(
+            {
+                "event_id": event_id,
+                "t_start_full": q_mod_evt.index[0],
+                "t_end_full": q_mod_evt.index[-1],
+                "duration_s": duration_s,
+                "Qmax_obs_m3s": Qmax_obs,
+                "t_Qmax_obs": t_Qmax_obs,
+                "Vol_obs_m3": Vol_obs_m3,
+                "Qmax_mod_m3s": Qmax_mod,
+                "t_Qmax_mod": t_Qmax_mod,
+                "Vol_mod_m3": Vol_mod_m3,
+            }
+        )
+
+        # =============================================================
+        # Tracé Q_obs / Q_mod / P pour l'évènement
+        # =============================================================
+        fig, ax1 = plt.subplots(figsize=(10, 4))
+
+        # Q_mod
+        ax1.plot(
+            q_mod_evt.index,
+            q_mod_evt.values,
+            label="Q_mod (m³/s)",
+            linewidth=1.4,
+        )
+
+        # Q_obs si dispo
+        if q_obs_evt is not None and not q_obs_evt.empty:
+            ax1.plot(
+                q_obs_evt.index,
+                q_obs_evt.values,
+                label="Q_obs (m³/s)",
+                linewidth=1.0,
+                alpha=0.7,
+            )
+
+        ax1.set_ylabel("Débit (m³/s)")
+        ax1.set_xlabel("Temps")
+        ax1.grid(True, linestyle="--", alpha=0.4)
+
+        # Pluie
+        ax2 = ax1.twinx()
+        dt_days = dt_seconds / 86400.0
+        ax2.bar(
+            P_evt.index,
+            P_evt.values,
+            width=dt_days * 0.8,
+            alpha=0.25,
+            label="P (mm/pas)",
+        )
+        ax2.set_ylabel("Pluie (mm/pas)")
+
+        # Légende combinée
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+        fig.suptitle(
+            f"Évènement {event_id} (modèle) : {q_mod_evt.index[0]:%Y-%m-%d %H:%M} → "
+            f"{q_mod_evt.index[-1]:%Y-%m-%d %H:%M}",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        fig_path = events_mod_dir / f"event_mod_{event_id:03d}.png"
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+
+        print(f"[OK] Figure évènement modèle {event_id} enregistrée : {fig_path}")
+
+    # =================================================================
+    # Écriture du CSV de métriques évènementielles
+    # =================================================================
+    if metrics_rows:
+        metrics_df = pd.DataFrame(metrics_rows).set_index("event_id")
+        out_metrics_path = events_mod_dir / "events_mod_vs_obs_summary.csv"
+        metrics_df.to_csv(out_metrics_path)
+        print(f"[OK] Tableau évènements (obs vs mod) écrit dans : {out_metrics_path}")
+    else:
+        print("[INFO] Aucun évènement utilisable pour le modèle (fenêtres vides ?)")
+
+
+
 
 
 # ======================================================================
@@ -351,26 +516,77 @@ def compute_rmse(q_obs: np.ndarray, q_mod: np.ndarray) -> float:
     diff = q_mod[mask] - q_obs[mask]
     rmse = np.sqrt(np.mean(diff**2))
     return float(rmse)
+def compute_composite_loss(q_obs: np.ndarray,
+                           q_mod: np.ndarray,
+                           data: dict,
+                           q_event_thr: float | None = None,
+                           alpha_events: float = 10.0,
+                           beta_runoff: float = 50.0) -> float:
+    """
+    Fonction objectif composite pour le calage.
 
+    - RMSE globale sur toute la série
+    - RMSE sur les 'événements' (gros débits observés)
+    - pénalité forte sur le coefficient de ruissellement global
 
+    J = RMSE_all + alpha_events * RMSE_events
+        + beta_runoff * (C_mod - C_obs)^2
+    """
+
+    q_obs = np.asarray(q_obs, dtype=float)
+    q_mod = np.asarray(q_mod, dtype=float)
+
+    dt = data["dt"]
+    A  = data["A_BV_M2"]
+    p_rate = np.asarray(data["p_rate"], dtype=float)
+
+    # 1) RMSE globale
+    rmse_all = compute_rmse(q_obs, q_mod)
+
+    # 2) RMSE sur les crues : on prend les 10 % plus gros débits observés
+    if q_event_thr is None:
+        q_event_thr = np.nanpercentile(q_obs, 70.0)
+
+    mask_evt = q_obs > q_event_thr
+    if mask_evt.sum() > 0:
+        rmse_evt = compute_rmse(q_obs[mask_evt], q_mod[mask_evt])
+    else:
+        rmse_evt = rmse_all  # fallback si pas d'événements détectés
+
+    # 3) Terme sur le coefficient de ruissellement global
+    V_obs = float(np.nansum(q_obs) * dt)   # m3
+    V_mod = float(np.nansum(q_mod) * dt)   # m3
+    P_tot = float(np.nansum(p_rate) * dt)  # m
+
+    if P_tot > 0.0 and A > 0.0 and V_obs > 0.0:
+        C_obs = V_obs / (P_tot * A)
+        C_mod = V_mod / (P_tot * A)
+        pen_runoff = (C_mod - C_obs) ** 2
+    else:
+        pen_runoff = 0.0
+
+    J = rmse_all + alpha_events * rmse_evt + beta_runoff * pen_runoff
+
+    if not np.isfinite(J):
+        return 1e6
+
+    return float(J)
 def objective(theta: np.ndarray, data: dict) -> float:
     """
     Fonction objectif à MINIMISER (multistart + optimisation locale).
 
     theta = [i_a, s, log10_k_infiltr, log10_k_seepage]
-
-    On travaille en log10 pour les coefficients pour les garder > 0
-    et mieux conditionner l'optimisation.
     """
     i_a, s, log10_k_infiltr, log10_k_seepage = theta
 
-    # Quelques gardes-fous simples (éviter des valeurs absurdes)
+    # Gardes-fous simples
     if i_a < 0.0 or i_a > 0.3 or s <= 0.0 or s > 1.5:
         return 1e6
+
     k_infiltr = 10.0 ** log10_k_infiltr
     k_seepage = 10.0 ** log10_k_seepage
 
-    # Simulation du modèle avec ces paramètres
+    # Simulation du modèle
     res = run_scs_hsm_guinot(
         dt=data["dt"],
         p_rate=data["p_rate"],
@@ -387,11 +603,17 @@ def objective(theta: np.ndarray, data: dict) -> float:
     r_rate = res["r_rate"]              # [m/s]
     q_mod = r_rate * data["A_BV_M2"]    # -> m³/s
 
-    rmse = compute_rmse(data["q_obs_m3s"], q_mod)
-    if not np.isfinite(rmse):
-        return 1e6
+    J = compute_composite_loss(
+        data["q_obs_m3s"],
+        q_mod,
+        data,
+        q_event_thr=None,   # => seuil = 90e percentile
+        alpha_events=10.0,
+        beta_runoff=50.0
+    )
 
-    return rmse
+    return J
+
 
 
 def sample_random_theta(bounds: list[tuple[float, float]]) -> np.ndarray:
@@ -432,7 +654,7 @@ def calibrate_multistart(
     args=(data,),
     method="Powell",
     bounds=bounds,          # ➜ très important
-    options={"maxiter": 150, "disp": False},
+    options={"maxiter": 120, "disp": False},
 )
 
 
@@ -467,14 +689,14 @@ def main():
     # --------------------------------------------------------------
     # 2. CALAGE (optionnel)
     # --------------------------------------------------------------
-    DO_CALIBRATION = True
+    DO_CALIBRATION = False
     
     if DO_CALIBRATION and q_obs_m3s is not None:
         bounds = [
-            (0.0, 0.1),      # i_a : 0 à 10 cm 
-            (0.05, 0.8),     # s   : 5 cm à 80 cm
-            (-10.0, -4.0),   # log10(k_infiltr) ~ 1e-10 à 1e-4
-            (-10.0, -4.0),   # log10(k_seepage) ~ 1e-10 à 1e-4
+            (0.0, 0.12),      # i_a : 0 à 12 cm 
+            (0.02, 0.9),     # s   : 2 cm à 90 cm
+            (-9.0, -4.0),   # log10(k_infiltr) ~ 1e-10 à 1e-4
+            (-9.0, -4.0),   # log10(k_seepage) ~ 1e-10 à 1e-4
         ]
 
         data = {
@@ -505,10 +727,10 @@ def main():
         k_seepage = k_seepage_opt
 
     else:
-        i_a = 0.04  
-        s = 0.5    
-        k_infiltr = 5e-7
-        k_seepage = 5e-7
+        i_a = 0.049852  
+        s = 1.399951   
+        k_infiltr = 1.000e-04
+        k_seepage = 1.126e-08
 
     # --------------------------------------------------------------
     # 3. Simulation
@@ -530,7 +752,6 @@ def main():
     h_a = res["h_a"][:-1]
     h_s = res["h_s"][:-1]
     h_r = res["h_r"][:-1]
-
     # --------------------------------------------------------------
     # 4. Séries complètes (AUCUNE décimation)
     # --------------------------------------------------------------
@@ -550,9 +771,9 @@ def main():
     Runoff_mm_5 = r_rate   * factor_mm_5min
 
     # Cumuls en mm
-    P_cum_mm      = np.cumsum(p_rate   * dt * 1000.0)
-    R_cum_mm      = np.cumsum(r_rate   * dt * 1000.0)
-    Infil_cum_mm  = np.cumsum(infil    * dt * 1000.0)
+    P_cum_mm      = np.cumsum(p_rate    * dt * 1000.0)
+    R_cum_mm      = np.cumsum(r_rate    * dt * 1000.0)
+    Infil_cum_mm  = np.cumsum(infil     * dt * 1000.0)
     Seep_cum_mm   = np.cumsum(seep_loss * 1000.0)
     ET_cum_mm     = np.cumsum(sa_loss   * 1000.0)
 
@@ -574,7 +795,7 @@ def main():
     h_r_plot = h_r
 
     if q_obs is not None:
-        q_obs_m3s = np.asarray(q_obs, dtype=float) / 1000.0  # si Q_ls en L/s
+        q_obs_m3s  = np.asarray(q_obs, dtype=float) / 1000.0  # si Q_ls en L/s
         q_obs_plot = q_obs_m3s
     else:
         q_obs_plot = None
@@ -583,80 +804,85 @@ def main():
     q_mod_plot = q_mod_full
 
     # --------------------------------------------------------------
-    # 5. FIGURES (optimisées mais FULL RESOLUTION)
+    # 5. FIGURES (FULL RESOLUTION, PAS DE COMPRESSION)
     # --------------------------------------------------------------
-    base_dir = Path(__file__).resolve().parent
+    base_dir  = Path(__file__).resolve().parent
     plots_dir = base_dir.parent / "03_Plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     # FIGURE 1 : flux instantanés
-    fig1, ax = plt.subplots(figsize=(10, 4))
+    fig1, ax = plt.subplots(figsize=(12, 5))
 
     ax.plot(t_plot, Qeff_mm_5_plot,   label="Pluie nette q (mm / 5 min)",
-            linewidth=0.8, antialiased=False)
+            linewidth=1.0)
     ax.plot(t_plot, Infil_mm_5_plot,  label="Infiltration (mm / 5 min)",
-            linewidth=0.8, antialiased=False)
+            linewidth=1.0)
     ax.plot(t_plot, Runoff_mm_5_plot, label="Ruissellement r (mm / 5 min)",
-            linewidth=0.8, antialiased=False)
+            linewidth=1.0)
 
-    # Pluie en aplat plutôt qu'en barres (plus rapide que ax.bar)
+    # Pluie en aplat
     ax.fill_between(t_plot, 0, P_mm_5_plot,
                     step="post", alpha=0.3, label="P (mm / 5 min)")
 
     ax.set_xlabel("Date")
     ax.set_ylabel("Flux (mm / 5 min)")
-    ax.grid(True, linewidth=0.3)
+    ax.grid(True, linewidth=0.4, alpha=0.6)
     ax.legend(loc="upper right")
     fig1.suptitle("Flux instantanés (P, q, infiltration, ruissellement)")
-    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=80)
+    fig1.tight_layout()
+    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=150)
     plt.close(fig1)
 
     # FIGURE 2 : cumuls (mm)
-    fig2, ax2 = plt.subplots(figsize=(10, 4))
+    fig2, ax2 = plt.subplots(figsize=(12, 5))
 
-    ax2.plot(t_plot, P_cum_plot,      label="P cumulée", linewidth=1.0, antialiased=False)
-    ax2.plot(t_plot, R_cum_plot,      label="Ruissellement cumulé", linewidth=1.0, antialiased=False)
-    ax2.plot(t_plot, Infil_cum_plot,  label="Infiltration cumulée", linewidth=0.8, antialiased=False)
-    ax2.plot(t_plot, Seep_cum_plot,   label="Seepage cumulé", linestyle="--", linewidth=0.8)
-    ax2.plot(t_plot, ET_cum_plot,     label="ET sur Ia cumulée", linestyle=":", linewidth=0.8)
+    ax2.plot(t_plot, P_cum_plot,      label="P cumulée", linewidth=1.2)
+    ax2.plot(t_plot, R_cum_plot,      label="Ruissellement cumulé", linewidth=1.2)
+    ax2.plot(t_plot, Infil_cum_plot,  label="Infiltration cumulée", linewidth=1.0)
+    ax2.plot(t_plot, Seep_cum_plot,   label="Seepage cumulé", linestyle="--", linewidth=1.0)
+    ax2.plot(t_plot, ET_cum_plot,     label="ET sur Ia cumulée", linestyle=":", linewidth=1.0)
 
     ax2.set_xlabel("Date")
     ax2.set_ylabel("Lame cumulée (mm)")
-    ax2.grid(True, linewidth=0.3)
+    ax2.grid(True, linewidth=0.4, alpha=0.6)
     ax2.legend(loc="upper left")
     fig2.suptitle("Cumuls P / ruissellement / infiltration / ET / seepage")
-    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep.png", dpi=80)
+    fig2.tight_layout()
+    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep.png", dpi=150)
     plt.close(fig2)
 
     # FIGURE 3 : États des réservoirs
-    fig3, ax3 = plt.subplots(figsize=(10, 4))
+    fig3, ax3 = plt.subplots(figsize=(12, 5))
 
-    ax3.plot(t_plot, h_a_plot, label="h_a (Ia)",  color="grey",  linewidth=0.8)
-    ax3.plot(t_plot, h_s_plot, label="h_s (sol)", color="green", linewidth=0.8)
-    ax3.plot(t_plot, h_r_plot, label="h_r",       color="red",   linewidth=0.8)
+    ax3.plot(t_plot, h_a_plot, label="h_a (Ia)",  color="grey",  linewidth=1.0)
+    ax3.plot(t_plot, h_s_plot, label="h_s (sol)", color="green", linewidth=1.0)
+    ax3.plot(t_plot, h_r_plot, label="h_r",       color="red",   linewidth=1.0)
 
     ax3.set_xlabel("Date")
     ax3.set_ylabel("Hauteurs (m)")
-    ax3.grid(True, linewidth=0.3)
+    ax3.grid(True, linewidth=0.4, alpha=0.6)
     ax3.legend(loc="upper left")
     fig3.suptitle("États des réservoirs (Ia, sol, runoff)")
-    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff.png", dpi=80)
+    fig3.tight_layout()
+    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff.png", dpi=150)
     plt.close(fig3)
 
     # FIGURE 4 : Hydrogramme Q_mod vs Q_obs
     if q_obs_plot is not None:
-        fig4, ax4 = plt.subplots(figsize=(10, 4))
+        fig4, ax4 = plt.subplots(figsize=(12, 5))
+
         ax4.plot(t_plot, q_mod_plot, label="Q_mod (r_rate * A)",
-                 linewidth=0.8, antialiased=False)
+                 linewidth=1.2)
         ax4.plot(t_plot, q_obs_plot, label="Q_obs (Q_ls)",
-                 linewidth=0.8, alpha=0.7, antialiased=False)
+                 linewidth=1.0, alpha=0.7)
 
         ax4.set_xlabel("Date")
         ax4.set_ylabel("Débit (m³/s)")
-        ax4.grid(True, linewidth=0.3)
+        ax4.grid(True, linewidth=0.4, alpha=0.6)
         ax4.legend(loc="upper right")
         fig4.suptitle("Comparaison Q_mod vs Q_obs (m³/s)")
-        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs.png", dpi=80)
+        fig4.tight_layout()
+        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs.png", dpi=150)
         plt.close(fig4)
     else:
         print("Pas de Q_obs : pas de figure Q_mod vs Q_obs.")
@@ -665,6 +891,24 @@ def main():
     # 6. Bilan de masse
     # --------------------------------------------------------------
     print_mass_balance(res["mass_balance"])
+    
+    # --------------------------------------------------------------
+    # 7. Analyse évènementielle modèle (Q_mod vs Q_obs + P)
+    # --------------------------------------------------------------
+    if q_obs is not None:
+        q_obs_m3s = np.asarray(q_obs, dtype=float) / 1000.0
+    else:
+        q_obs_m3s = None
+
+    analyse_evenements_modele(
+        time_index=time_index,
+        q_mod_full=q_mod_full,
+        q_obs_m3s=q_obs_m3s,
+        rain_5min_mm=rain_5min_mm,
+        dt=dt,
+        A_BV_M2=A_BV_M2,
+    )
+
 
 
 

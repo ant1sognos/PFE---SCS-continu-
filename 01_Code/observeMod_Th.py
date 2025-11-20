@@ -33,7 +33,7 @@ def detect_runoff_events(
     pre_pad_steps: int = 12,
     post_pad_steps: int = 24,
     dt_seconds: float | None = None,
-    out_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,x²
     prefix: str = "events",
 ):
     """

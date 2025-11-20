@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Nov 20 11:03:44 2025
+
+@author: asognos
+"""
+
+# -*- coding: utf-8 -*-
+"""
 Simulation du modèle SCS-HSM à partir :
   - d'une série P(t), Q_ls(t) issue de ../02_Data/PQ_BV_Cloutasse.csv
   - d'une série ETP journalière SAFRAN issue de ../02_Data/ETP_SAFRAN_J.csv
@@ -669,7 +676,7 @@ def calibrate_multistart(
     return best_theta, best_J
     
 def main():
-    dt = 300.0  # pas de temps = 5 min
+    dt = 300.0 # pas de temps = 5 min
     csv_rain = "PQ_BV_Cloutasse.csv"
     csv_etp = "ETP_SAFRAN_J.csv"
 
@@ -691,12 +698,12 @@ def main():
     # --------------------------------------------------------------
     # 2. CALAGE 
     # --------------------------------------------------------------
-    DO_CALIBRATION = True
+    DO_CALIBRATION = False
     
     if DO_CALIBRATION and q_obs_m3s is not None:
         bounds = [
             (0.0, 0.12),      # i_a : 0 à 12 cm 
-            (0.02, 0.9),     # s   : 2 cm à 90 cm
+            (0.02, 0.9),     # s : 2 cm à 90 cm
             (-9.0, -4.0),   # log10(k_infiltr) ~ 1e-10 à 1e-4
             (-9.0, -4.0),   # log10(k_seepage) ~ 1e-10 à 1e-4
         ]
@@ -729,10 +736,10 @@ def main():
         k_seepage = k_seepage_opt
 
     else:
-        i_a = 0.049852  
-        s = 1.399951   
-        k_infiltr = 1.000e-04
-        k_seepage = 1.126e-08
+        i_a = 0.05
+        s = 0.5   
+        k_infiltr = 1e-6
+        k_seepage = 1e-6
 
     # --------------------------------------------------------------
     # 3. Simulation
@@ -813,6 +820,30 @@ def main():
     base_dir  = Path(__file__).resolve().parent
     plots_dir = base_dir.parent / "03_Plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
+    
+    # FIGURE 1 : flux instantanés
+    fig1, ax = plt.subplots(figsize=(10, 4))
+
+    ax.plot(t_plot, Qeff_mm_5_plot,   label="Pluie nette q (mm / 5 min)",
+            linewidth=0.8, antialiased=False)
+    ax.plot(t_plot, Infil_mm_5_plot,  label="Infiltration (mm / 5 min)",
+            linewidth=0.8, antialiased=False)
+    ax.plot(t_plot, Runoff_mm_5_plot, label="Ruissellement r (mm / 5 min)",
+            linewidth=0.8, antialiased=False)
+
+    # Pluie en aplat plutôt qu'en barres (plus rapide que ax.bar)
+    ax.fill_between(t_plot, 0, P_mm_5_plot,
+                    step="post", alpha=0.3, label="P (mm / 5 min)")
+
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Flux (mm / 5 min)")
+    ax.grid(True, linewidth=0.3)
+    ax.legend(loc="upper right")
+    fig1.suptitle("Flux instantanés (P, q, infiltration, ruissellement)")
+    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=150)
+    plt.close(fig1)
+
+
 
     
     # FIGURE 2 : cumuls (mm)

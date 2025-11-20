@@ -8,10 +8,7 @@ Remplissage hydrologique de Q_ls :
  - interpolation à l’intérieur des événements
 Écrit un nouveau CSV avec une colonne Q_ls_filled.
 
-À placer dans : 01_Code/
-Fichiers utilisés :
- - ../02_Data/PQ_BV_Cloutasse.csv
- - écrit : ../02_Data/PQ_BV_Cloutasse_filled_Q0.csv
+Ajout : calcul de la moyenne et de la variance des débits (original et final)
 """
 
 import pandas as pd
@@ -43,7 +40,7 @@ def main():
     df["dateP"] = pd.to_datetime(df["dateP"])
     df["dateQ"] = pd.to_datetime(df["dateQ"])
 
-    # Tri par temps au cas où
+    # Tri par temps
     df = df.sort_values("dateQ").reset_index(drop=True)
 
     # Série de base
@@ -56,11 +53,10 @@ def main():
     Q_step1 = Q.interpolate(method="linear", limit=3, limit_direction="both")
 
     # ------------------------------------------------------------------
-    # 4. Identification des périodes "évènementielles" (pluie)
-    #    Un évènement : pluie > 0.1 mm/5min dans une fenêtre +/- ~30 min
+    # 4. Identification des périodes évènementielles
     # ------------------------------------------------------------------
     is_rain = P > 0.1
-    window = 7  # environ 7 * 5min ≈ 35 min
+    window = 7  # environ 35 min
     event_mask = is_rain.rolling(
         window=window, center=True, min_periods=1
     ).max().astype(bool)
@@ -73,30 +69,25 @@ def main():
     Q_step2.loc[dry_mask] = 0.0
 
     # ------------------------------------------------------------------
-    # 6. Interpolation dans les évènements pour les NaN restants
+    # 6. Interpolation dans les évènements
     # ------------------------------------------------------------------
     Q_final = Q_step2.copy()
     in_event = event_mask.fillna(False)
-
-    # Découpage en segments contigus
     segment_id = (in_event != in_event.shift(1)).cumsum()
 
     for seg_val in segment_id.unique():
         seg_mask = segment_id == seg_val
 
-        # On ne garde que les segments "évènementiels"
         if not in_event[seg_mask].any():
             continue
 
         Q_seg = Q_final[seg_mask]
 
-        # Si au moins 2 valeurs non-NaN -> interpolation dans ce segment
         if Q_seg.notna().sum() >= 2:
             Q_final.loc[seg_mask] = Q_seg.interpolate(
                 method="linear",
                 limit_direction="both"
             )
-        # Sinon : on laisse tel quel (NaN ou plateau)
 
     # ------------------------------------------------------------------
     # 7. Remplacer les NaN résiduels par 0
@@ -104,7 +95,16 @@ def main():
     Q_final = Q_final.fillna(0.0)
 
     # ------------------------------------------------------------------
-    # 8. Résumé du traitement
+    # 8. Statistiques supplémentaires (MOYENNE & VARIANCE)
+    # ------------------------------------------------------------------
+    Q_original_mean = float(Q.mean())
+    Q_original_var  = float(Q.var())
+
+    Q_final_mean = float(Q_final.mean())
+    Q_final_var  = float(Q_final.var())
+
+    # ------------------------------------------------------------------
+    # 9. Résumé du traitement
     # ------------------------------------------------------------------
     before_nan_pct = Q.isna().mean() * 100.0
     after_nan_pct = Q_final.isna().mean() * 100.0
@@ -120,14 +120,19 @@ def main():
         "max_Q_original": float(Q.max()),
         "min_Q_final": float(Q_final.min()),
         "max_Q_final": float(Q_final.max()),
+        "mean_Q_original": Q_original_mean,
+        "var_Q_original": Q_original_var,
+        "mean_Q_filled": Q_final_mean,
+        "var_Q_filled": Q_final_var,
     }
 
+    # Impression propre
     print("\n=== DIAGNOSTIC Q_ls ===")
     for k, v in summary.items():
         print(f"{k}: {v}")
 
     # ------------------------------------------------------------------
-    # 9. Sauvegarde du CSV enrichi
+    # 10. Sauvegarde du CSV enrichi
     # ------------------------------------------------------------------
     df["Q_ls_filled"] = Q_final
 

@@ -36,6 +36,7 @@ from scipy.optimize import minimize
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
+
 # Accélérer le rendu des grandes séries
 mpl.rcParams["path.simplify"] = True
 mpl.rcParams["path.simplify_threshold"] = 1.0
@@ -47,6 +48,297 @@ mpl.rcParams["agg.path.chunksize"] = 10000
 
 # 0. Tracé des débits modélisés 
 # ======================================================================
+
+
+def detect_runoff_events(
+    Q: pd.Series,
+    P: pd.Series | None = None,
+    threshold: float | None = None,
+    threshold_quantile: float = 60.0,
+    qmin_event: float | None = None,
+    q_amp_min: float | None = None,
+    pmin_event_mm: float | None = None,
+    min_gap_steps: int = 24,
+    pre_pad_steps: int = 12,
+    post_pad_steps: int = 24,
+    dt_seconds: float | None = None,
+    out_dir: str | Path | None = None,
+    prefix: str = "events",
+):
+    """
+    Détection et découpage des évènements de ruissellement dans une série de débits.
+
+    Q : pd.Series
+        Débit (L/s ou m3/s) avec index temporel.
+    P : pd.Series ou None
+        Pluie (mm / pas de temps) avec le même index que Q (optionnel mais recommandé).
+    threshold :
+        - Si None, calculé comme le 'threshold_quantile' de Q (>0).
+        - Sinon, valeur absolue en unités de Q.
+    qmin_event :
+        Seuil minimal sur Qmax pour garder un événement (sinon rejeté).
+        Si None -> même valeur que 'threshold'.
+    q_amp_min :
+        Amplitude minimale (Qmax - Qmin_full) pour garder un événement.
+        Si None -> pas de filtrage sur l'amplitude.
+    pmin_event_mm :
+        Pluie cumulée minimale (mm) sur la fenêtre de l'évènement pour le garder.
+        Si None -> pas de filtrage sur la pluie.
+    """
+
+    if not isinstance(Q, pd.Series):
+        raise TypeError("Q doit être une pd.Series (débit avec index temporel).")
+
+    n = len(Q)
+    if n < 2:
+        raise ValueError("La série Q est trop courte pour détecter des évènements.")
+
+    if P is not None and not isinstance(P, pd.Series):
+        raise TypeError("P doit être une pd.Series si fournie.")
+    if P is not None and not Q.index.equals(P.index):
+        raise ValueError("Q et P doivent avoir exactement le même index.")
+
+    Q_values = Q.values.astype(float)
+
+    # 1) Détermination du pas de temps si possible
+    if dt_seconds is None:
+        if isinstance(Q.index, pd.DatetimeIndex):
+            dt_seconds = (Q.index[1] - Q.index[0]).total_seconds()
+        else:
+            raise ValueError(
+                "dt_seconds doit être fourni si l'index de Q n'est pas un DatetimeIndex."
+            )
+
+    # 2) Calcul / choix du seuil d'activité
+    if threshold is None:
+        q_pos = Q_values[np.isfinite(Q_values) & (Q_values > 0)]
+        if len(q_pos) == 0:
+            raise ValueError(
+                "Impossible d'estimer un seuil : Q ne contient que des NaN ou des zéros."
+            )
+        threshold = float(np.nanpercentile(q_pos, threshold_quantile))
+        print(
+            f"[INFO] Seuil automatique d'évènement (quantile {threshold_quantile}%) : "
+            f"{threshold:.3f} (unités de Q)"
+        )
+    else:
+        print(f"[INFO] Seuil d'évènement fixé manuellement : {threshold:.3f} (unités de Q)")
+
+    if qmin_event is None:
+        qmin_event = threshold
+        print(f"[INFO] Seuil de Qmax pour garder un évènement : qmin_event = {qmin_event:.3f}")
+    else:
+        print(f"[INFO] Seuil de Qmax fixé : qmin_event = {qmin_event:.3f}")
+
+    if q_amp_min is not None:
+        print(f"[INFO] Amplitude minimale de crue : q_amp_min = {q_amp_min:.3f} (unités de Q)")
+    if pmin_event_mm is not None:
+        print(f"[INFO] Pluie minimale par évènement : pmin_event_mm = {pmin_event_mm:.2f} mm")
+
+    # 3) Détection brute des instants actifs (Q > threshold)
+    is_valid = np.isfinite(Q_values)
+    is_active = (Q_values > threshold) & is_valid
+    is_active_clean = is_active.copy()
+
+    # 4) On comble les petits "trous" (segments inactifs trop courts)
+    inact = ~is_active_clean
+    changes = np.diff(inact.astype(int))
+
+    starts = np.where(changes == 1)[0] + 1
+    ends = np.where(changes == -1)[0]
+
+    if inact[0]:
+        starts = np.r_[0, starts]
+    if inact[-1]:
+        ends = np.r_[ends, n - 1]
+
+    for s, e in zip(starts, ends):
+        length = e - s + 1
+        if length < min_gap_steps:
+            is_active_clean[s : e + 1] = True
+
+    # 5) Après comblement, on redétecte les segments actifs
+    act = is_active_clean
+    changes = np.diff(act.astype(int))
+
+    starts = np.where(changes == 1)[0] + 1
+    ends = np.where(changes == -1)[0]
+
+    if act[0]:
+        starts = np.r_[0, starts]
+    if act[-1]:
+        ends = np.r_[ends, n - 1]
+
+    events = []
+    ts_rows = []
+
+    for s_core, e_core in zip(starts, ends):
+        # Indices avec padding avant/après
+        s_full = max(0, s_core - pre_pad_steps)
+        e_full = min(n - 1, e_core + post_pad_steps)
+
+        Q_evt = Q.iloc[s_full : e_full + 1]
+        Q_vals_evt = Q_evt.values.astype(float)
+
+        if not np.any(np.isfinite(Q_vals_evt)):
+            continue  # rien de valide
+
+        Qmax = float(np.nanmax(Q_vals_evt))
+        Qmin = float(np.nanmin(Q_vals_evt))
+        Q_amp = Qmax - Qmin
+
+        # -- filtres --
+        if Qmax < qmin_event:
+            continue
+        if (q_amp_min is not None) and (Q_amp < q_amp_min):
+            continue
+
+        # Pluie sur l'évènement si dispo
+        if P is not None:
+            P_evt = P.iloc[s_full : e_full + 1].values.astype(float)
+            P_tot = float(np.nansum(np.nan_to_num(P_evt, nan=0.0)))
+            if (pmin_event_mm is not None) and (P_tot < pmin_event_mm):
+                continue
+        else:
+            P_tot = np.nan
+
+        t_Qmax = Q_evt.idxmax()
+        volume = float(np.nansum(np.nan_to_num(Q_vals_evt, nan=0.0)) * dt_seconds)
+        duration_full_s = (e_full - s_full + 1) * dt_seconds
+        duration_core_s = (e_core - s_core + 1) * dt_seconds
+
+        event_id = len(events) + 1
+
+        events.append(
+            {
+                "event_id": event_id,
+                "t_start_full": Q.index[s_full],
+                "t_end_full": Q.index[e_full],
+                "t_start_core": Q.index[s_core],
+                "t_end_core": Q.index[e_core],
+                "duration_full_s": duration_full_s,
+                "duration_core_s": duration_core_s,
+                "Qmax": Qmax,
+                "Qmin_full": Qmin,
+                "Q_amp": Q_amp,
+                "t_Qmax": t_Qmax,
+                "volume_Q_dt": volume,
+                "P_tot_mm": P_tot,
+            }
+        )
+
+        if P is not None:
+            P_evt_series = P.iloc[s_full : e_full + 1]
+        else:
+            P_evt_series = pd.Series(data=np.nan, index=Q_evt.index, name="P_mm")
+
+        tmp = pd.DataFrame(
+            {
+                "event_id": event_id,
+                "time": Q_evt.index,
+                "Q": Q_evt.values,
+                "P_mm": P_evt_series.values,
+            }
+        )
+        ts_rows.append(tmp)
+
+    if events:
+        events_df = pd.DataFrame(events).set_index("event_id")
+        ts_df = pd.concat(ts_rows, ignore_index=True)
+    else:
+        events_df = pd.DataFrame(
+            columns=[
+                "t_start_full",
+                "t_end_full",
+                "t_start_core",
+                "t_end_core",
+                "duration_full_s",
+                "duration_core_s",
+                "Qmax",
+                "Qmin_full",
+                "Q_amp",
+                "t_Qmax",
+                "volume_Q_dt",
+                "P_tot_mm",
+            ]
+        )
+        ts_df = pd.DataFrame(columns=["event_id", "time", "Q", "P_mm"])
+
+    # 6) Sauvegarde éventuelle sur disque
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        events_path = out_dir / f"{prefix}_summary.csv"
+        ts_path = out_dir / f"{prefix}_timeseries.csv"
+
+        events_df.to_csv(events_path, index=True)
+        ts_df.to_csv(ts_path, index=False)
+
+        print(f"[OK] Résumé évènements écrit dans : {events_path}")
+        print(f"[OK] Séries découpées écrites dans : {ts_path}")
+
+    return events_df, ts_df
+
+
+    # --------------------------------------------------------------
+    # Tracés des évènements détectés sur Q_mod
+    # --------------------------------------------------------------
+    for event_id, row in events_mod_df.iterrows():
+        t0 = row["t_start_full"]
+        t1 = row["t_end_full"]
+
+        q_evt = Q_mod_series.loc[t0:t1]
+        P_evt = P_series.loc[t0:t1]
+
+        if q_evt.empty:
+            continue
+
+        fig, ax1 = plt.subplots(figsize=(10, 4))
+
+        # Q_mod
+        ax1.plot(
+            q_evt.index,
+            q_evt.values,
+            label="Q_mod (m³/s)",
+            linewidth=1.4,
+        )
+
+        ax1.set_ylabel("Débit (m³/s)")
+        ax1.set_xlabel("Temps")
+        ax1.grid(True, linestyle="--", alpha=0.4)
+
+        # Pluie
+        ax2 = ax1.twinx()
+        dt_days = dt / 86400.0
+        ax2.bar(
+            P_evt.index,
+            P_evt.values,
+            width=dt_days * 0.8,
+            alpha=0.25,
+            label="P (mm/pas)",
+        )
+        ax2.set_ylabel("Pluie (mm/pas)")
+
+        # Légende combinée
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+        fig.suptitle(
+            f"Évènement Q_mod {event_id} : {q_evt.index[0]:%Y-%m-%d %H:%M} → "
+            f"{q_evt.index[-1]:%Y-%m-%d %H:%M}",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        fig_path = events_mod_dir / f"event_Qmod_{event_id:03d}.png"
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+
+        print(f"[OK] Figure évènement Q_mod {event_id} enregistrée : {fig_path}")
+
+
 
 def analyse_evenements_modele(
     time_index: pd.DatetimeIndex,
@@ -218,6 +510,71 @@ def analyse_evenements_modele(
         print(f"[OK] Tableau évènements (obs vs mod) écrit dans : {out_metrics_path}")
     else:
         print("[INFO] Aucun évènement utilisable pour le modèle (fenêtres vides ?)")
+
+
+
+def plot_qmod_events(
+    time_index,
+    q_mod_full,
+    q_obs_m3s,
+    rain_5min_mm,
+    dt,
+    events_mod_df,
+    out_dir,
+):
+    dt_seconds = float(dt)
+    q_mod_series = pd.Series(q_mod_full, index=time_index, name="Q_mod_m3s")
+    P_series = pd.Series(rain_5min_mm, index=time_index, name="P_mm_5min")
+    q_obs_series = (
+        pd.Series(q_obs_m3s, index=time_index, name="Q_obs_m3s")
+        if q_obs_m3s is not None else None
+    )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for event_id, row in events_mod_df.iterrows():
+        t0 = row["t_start_full"]
+        t1 = row["t_end_full"]
+
+        q_mod_evt = q_mod_series.loc[t0:t1]
+        P_evt     = P_series.loc[t0:t1]
+        q_obs_evt = q_obs_series.loc[t0:t1] if q_obs_series is not None else None
+
+        if q_mod_evt.empty:
+            continue
+
+        fig, ax1 = plt.subplots(figsize=(10, 4))
+
+        ax1.plot(q_mod_evt.index, q_mod_evt.values,
+                 label="Q_mod (m³/s)", linewidth=1.4)
+        if q_obs_evt is not None and not q_obs_evt.empty:
+            ax1.plot(q_obs_evt.index, q_obs_evt.values,
+                     label="Q_obs (m³/s)", linewidth=1.0, alpha=0.7)
+
+        ax1.set_ylabel("Débit (m³/s)")
+        ax1.set_xlabel("Temps")
+        ax1.grid(True, linestyle="--", alpha=0.4)
+
+        ax2 = ax1.twinx()
+        dt_days = dt_seconds / 86400.0
+        ax2.bar(P_evt.index, P_evt.values,
+                width=dt_days * 0.8, alpha=0.25, label="P (mm/pas)")
+        ax2.set_ylabel("Pluie (mm/pas)")
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+        fig.suptitle(
+            f"Évènement Q_mod {event_id} : {q_mod_evt.index[0]:%Y-%m-%d %H:%M} → "
+            f"{q_mod_evt.index[-1]:%Y-%m-%d %H:%M}",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        fig.savefig(out_dir / f"event_Qmod_{event_id:03d}.png", dpi=150)
+        plt.close(fig)
+
 
 
 
@@ -698,7 +1055,7 @@ def main():
     # --------------------------------------------------------------
     # 2. CALAGE 
     # --------------------------------------------------------------
-    DO_CALIBRATION = True
+    DO_CALIBRATION = False
     
     if DO_CALIBRATION and q_obs_m3s is not None:
         bounds = [
@@ -736,11 +1093,10 @@ def main():
         k_seepage = k_seepage_opt
 
     else:
-        i_a = 0.05
-        s = 0.5   
-        k_infiltr = 1e-6
-        k_seepage = 1e-6
-
+        i_a = 0.119964 
+        s = 0.9   
+        k_infiltr = 1e-4
+        k_seepage = 5.525e-08
     # --------------------------------------------------------------
     # 3. Simulation
     # --------------------------------------------------------------
@@ -812,13 +1168,53 @@ def main():
         q_obs_plot = None
 
     q_mod_full = r_rate * A_BV_M2
-    q_mod_plot = q_mod_full
+    q_mod_plot = q_mod_full   
+    # --------------------------------------------------------------
+    # NOUVEAU : détection des événements directement sur Q_mod
+    # --------------------------------------------------------------
+    base_dir = Path(__file__).resolve().parent
+    events_mod_dir = base_dir.parent / "03_Plots" / "events_Qmod"
+    events_mod_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\nDétection des évènements directement sur Q_mod...")
+
+    Q_mod_series = pd.Series(q_mod_full, index=time_index, name="Q_mod_m3s")
+    P_series = pd.Series(rain_5min_mm, index=time_index, name="P_mm")
+
+    events_mod_df, ts_mod_df = detect_runoff_events(
+        Q=Q_mod_series,
+        P=P_series,
+        threshold=None,              # seuil automatique
+        threshold_quantile=60.0,     # percentile du seuil
+        qmin_event=None,             # même que threshold
+        q_amp_min=0.0005,            # amplitude min [m³/s] (à ajuster)
+        pmin_event_mm=1.0,           # pluie min
+        min_gap_steps=24,
+        pre_pad_steps=12,
+        post_pad_steps=36,
+        dt_seconds=dt,
+        out_dir=events_mod_dir,
+        prefix="mod",
+    )
+    plot_qmod_events(
+    time_index=time_index,
+    q_mod_full=q_mod_full,
+    q_obs_m3s=q_obs_m3s,
+    rain_5min_mm=rain_5min_mm,
+    dt=dt,
+    events_mod_df=events_mod_df,
+    out_dir=events_mod_dir,   # le même que pour les CSV
+)
+
+
+    print(f"[MOD] Nombre d'évènements détectés sur Q_mod : {len(events_mod_df)}")
+
 
     # --------------------------------------------------------------
     # 5. FIGURES (FULL RESOLUTION, PAS DE COMPRESSION)
     # --------------------------------------------------------------
     base_dir  = Path(__file__).resolve().parent
-    plots_dir = base_dir.parent / "04_Plots"
+    plots_dir = base_dir.parent / "03_Plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     
     # FIGURE 1 : flux instantanés
@@ -903,25 +1299,183 @@ def main():
     # --------------------------------------------------------------
     print_mass_balance(res["mass_balance"])
 
-    # --------------------------------------------------------------
+       # --------------------------------------------------------------
     # 7. Analyse évènementielle modèle (Q_mod vs Q_obs + P)
+    #     → nécessite d'avoir lancé préalablement observeMod_Th.py
+    #       pour créer 03_Plots/events_obs/obs_summary.csv
     # --------------------------------------------------------------
-    """
     if q_obs is not None:
-        q_obs_m3s = np.asarray(q_obs, dtype=float) / 1000.0
+        q_obs_m3s_evt = np.asarray(q_obs, dtype=float) / 1000.0  # L/s -> m³/s
     else:
-        q_obs_m3s = None
+        q_obs_m3s_evt = None
 
     analyse_evenements_modele(
         time_index=time_index,
         q_mod_full=q_mod_full,
-        q_obs_m3s=q_obs_m3s,
+        q_obs_m3s=q_obs_m3s_evt,
         rain_5min_mm=rain_5min_mm,
         dt=dt,
         A_BV_M2=A_BV_M2,
-    ) ""
-     
+    )
+
+# -*- coding: utf-8 -*-
+"""
+regression_volumes.py
+---------------------
+Tracer la régression entre les volumes observés et modélisés,
+et visualiser la dispersion autour de la droite x = y.
+
+Les figures sont sauvegardées dans :
+    ../03_Plots/Regression/
+par rapport au dossier du script.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+def compute_stats(V_obs, V_mod):
     """
+    Calcule quelques stats simples pour la comparaison.
+    """
+    V_obs = np.asarray(V_obs)
+    V_mod = np.asarray(V_mod)
+
+    # Filtrage des NaN éventuels
+    mask = np.isfinite(V_obs) & np.isfinite(V_mod)
+    V_obs = V_obs[mask]
+    V_mod = V_mod[mask]
+
+    # Régression linéaire mod = a * obs + b
+    a, b = np.polyfit(V_obs, V_mod, 1)
+
+    # R^2 (coefficient de détermination)
+    r = np.corrcoef(V_obs, V_mod)[0, 1]
+    r2 = r**2
+
+    # Biais moyen (mod - obs)
+    bias = np.mean(V_mod - V_obs)
+
+    # RMSE
+    rmse = np.sqrt(np.mean((V_mod - V_obs)**2))
+
+    stats = {
+        "a": a,
+        "b": b,
+        "r2": r2,
+        "bias": bias,
+        "rmse": rmse,
+        "V_obs": V_obs,
+        "V_mod": V_mod,
+    }
+    return stats
+
+
+def plot_volume_regression(V_obs, V_mod, name="regression_volumes"):
+    """
+    Trace le nuage de points V_mod en fonction de V_obs,
+    la droite x=y et la droite de régression linéaire.
+
+    Paramètres
+    ----------
+    V_obs : array-like
+        Volumes observés (par évènement).
+    V_mod : array-like
+        Volumes modélisés (par évènement).
+    name : str
+        Nom du fichier image (sans extension).
+    """
+    stats = compute_stats(V_obs, V_mod)
+    a = stats["a"]
+    b = stats["b"]
+    r2 = stats["r2"]
+    bias = stats["bias"]
+    rmse = stats["rmse"]
+    V_obs = stats["V_obs"]
+    V_mod = stats["V_mod"]
+
+    # Domaine pour les droites x=y et régression
+    v_min = min(V_obs.min(), V_mod.min())
+    v_max = max(V_obs.max(), V_mod.max())
+    marge = 0.05 * (v_max - v_min) if v_max > v_min else 1.0
+    x_line = np.linspace(v_min - marge, v_max + marge, 200)
+
+    # Droite 1:1
+    y_1to1 = x_line
+
+    # Droite de régression
+    y_reg = a * x_line + b
+
+    # ---------------- TRACÉ ----------------
+    plt.figure(figsize=(6.5, 6))
+
+    # Nuage de points
+    plt.scatter(V_obs, V_mod, s=35, alpha=0.7, label="Évènements")
+
+    # Droite x = y
+    plt.plot(x_line, y_1to1, "k--", label="Droite x = y")
+
+    # Droite de régression
+    plt.plot(x_line, y_reg, label=f"Régression : y = {a:.2f} x + {b:.2f}")
+
+    # Axes et style
+    plt.xlabel("Volume observé (unité)")
+    plt.ylabel("Volume modélisé (unité)")
+    plt.title("Régression volume observé vs volume modélisé")
+
+    plt.grid(alpha=0.3)
+    plt.axis("equal")  # pour que x=y soit visuellement à 45°
+    
+    # Texte avec indicateurs
+    text = (
+        f"a = {a:.2f}\n"
+        f"b = {b:.2f}\n"
+        f"$R^2$ = {r2:.2f}\n"
+        f"Biais = {bias:.2f}\n"
+        f"RMSE = {rmse:.2f}"
+    )
+    plt.annotate(
+        text,
+        xy=(0.05, 0.95),
+        xycoords="axes fraction",
+        va="top",
+        ha="left",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+
+    # ---------- Sauvegarde dans ../03_Plots/Regression ----------
+    base_dir = Path(__file__).resolve().parent.parent  # .../PFE---SCS-continu-
+    out_dir = base_dir / "03_Plots" / "Regression"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path = out_dir / f"{name}.png"
+    plt.savefig(save_path, dpi=300)
+    print(f"\n✔ Figure sauvegardée dans : {save_path}\n")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    # ==========================================================
+    # EXEMPLE FICTIF : à remplacer par tes vrais volumes
+    # (par évènement, en mm ou m³, peu importe ici)
+    # ==========================================================
+    rng = np.random.default_rng(0)
+
+    # Volumes observés
+    V_obs = rng.uniform(5, 50, size=40)
+
+    # Modèle avec léger biais et dispersion
+    V_mod = 0.9 * V_obs + rng.normal(0, 3, size=V_obs.size)
+
+    plot_volume_regression(V_obs, V_mod,
+                           name="regression_volumes_Qobs_Qmod")
+
 
 if __name__ == "__main__":
     main()

@@ -663,7 +663,7 @@ def calibrate_multistart(
     args=(data,),
     method="Powell",
     bounds=bounds,          # ➜ très important
-    options={"maxiter": 120, "disp": False},
+    options={"maxiter": 150, "disp": False},
 )
 
 
@@ -698,11 +698,11 @@ def main():
     # --------------------------------------------------------------
     # 2. CALAGE 
     # --------------------------------------------------------------
-    DO_CALIBRATION = False
+    DO_CALIBRATION = True
     
     if DO_CALIBRATION and q_obs_m3s is not None:
         bounds = [
-            (0.0, 0.12),      # i_a : 0 à 12 cm 
+            (0.02, 0.12),      # i_a : 0 à 12 cm 
             (0.02, 0.9),     # s : 2 cm à 90 cm
             (-9.0, -4.0),   # log10(k_infiltr) ~ 1e-10 à 1e-4
             (-9.0, -4.0),   # log10(k_seepage) ~ 1e-10 à 1e-4
@@ -717,7 +717,7 @@ def main():
         }
 
         print("Lancement du calage (multistart + Powell) sur RMSE(Q_mod, Q_obs)...")
-        theta_opt, J_opt = calibrate_multistart(data, bounds, n_starts=3)
+        theta_opt, J_opt = calibrate_multistart(data, bounds, n_starts=15)
 
         i_a_opt, s_opt, log10_k_infiltr_opt, log10_k_seepage_opt = theta_opt
         k_infiltr_opt = 10.0 ** log10_k_infiltr_opt
@@ -818,7 +818,7 @@ def main():
     # 5. FIGURES (FULL RESOLUTION, PAS DE COMPRESSION)
     # --------------------------------------------------------------
     base_dir  = Path(__file__).resolve().parent
-    plots_dir = base_dir.parent / "03_Plots"
+    plots_dir = base_dir.parent / "04_Plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     
     # FIGURE 1 : flux instantanés
@@ -840,7 +840,7 @@ def main():
     ax.grid(True, linewidth=0.3)
     ax.legend(loc="upper right")
     fig1.suptitle("Flux instantanés (P, q, infiltration, ruissellement)")
-    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r.png", dpi=150)
+    fig1.savefig(plots_dir / "flux_instantanes_P_q_infil_r2.png", dpi=150)
     plt.close(fig1)
 
 
@@ -861,7 +861,7 @@ def main():
     ax2.legend(loc="upper left")
     fig2.suptitle("Cumuls P / ruissellement / infiltration / ET / seepage")
     fig2.tight_layout()
-    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep.png", dpi=150)
+    fig2.savefig(plots_dir / "cumuls_P_R_infil_ET_seep2.png", dpi=150)
     plt.close(fig2)
 
     # FIGURE 3 : États des réservoirs
@@ -877,7 +877,7 @@ def main():
     ax3.legend(loc="upper left")
     fig3.suptitle("États des réservoirs (Ia, sol, runoff)")
     fig3.tight_layout()
-    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff.png", dpi=150)
+    fig3.savefig(plots_dir / "etats_reservoirs_Ia_sol_runoff2.png", dpi=150)
     plt.close(fig3)
 
     # FIGURE 4 : Hydrogramme Q_mod vs Q_obs
@@ -893,7 +893,7 @@ def main():
         ax4.legend(loc="upper right")
         fig4.suptitle("Comparaison Q_mod vs Q_obs (m³/s)")
         fig4.tight_layout()
-        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs.png", dpi=150)
+        fig4.savefig(plots_dir / "Q_mod_vs_Q_obs2.png", dpi=150)
         plt.close(fig4)
     else:
         print("Pas de Q_obs : pas de figure Q_mod vs Q_obs.")

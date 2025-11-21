@@ -674,7 +674,7 @@ def calibrate_multistart(
     args=(data,),
     method="Powell",
     bounds=bounds,          # ➜ très important
-    options={"maxiter": 25, "disp": False},
+    options={"maxiter": 100, "disp": False},
 )
 
 
@@ -728,7 +728,7 @@ def main():
         }
 
         print("Lancement du calage (multistart + Powell) sur RMSE(Q_mod, Q_obs)...")
-        theta_opt, J_opt = calibrate_multistart(data, bounds, n_starts=1)
+        theta_opt, J_opt = calibrate_multistart(data, bounds, n_starts=15)
 
         i_a_opt, s_opt, log10_k_infiltr_opt, log10_k_seepage_opt = theta_opt
         k_infiltr_opt = 10.0 ** log10_k_infiltr_opt
